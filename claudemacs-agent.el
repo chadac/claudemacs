@@ -15,7 +15,6 @@
 ;;; Code:
 
 (require 'ansi-color)
-(require 'org)
 (require 'polymode)
 
 ;;;; Customization
@@ -131,7 +130,7 @@
 (define-innermode claudemacs-agent-org-innermode
   :mode 'org-mode
   :head-matcher "^━━━ Claude ━+\n"
-  :tail-matcher "^\n─── Input ─+"
+  :tail-matcher "^─── Input ─+"
   :head-mode 'host
   :tail-mode 'host)
 
@@ -360,17 +359,35 @@
       (claudemacs-agent--append-output (concat line "\n") face)))))
 
 (defun claudemacs-agent--append-output (text &optional face)
-  "Append TEXT to the output area (before input) with optional FACE."
+  "Append TEXT to the output area (before input) with optional FACE.
+Uses overlays for faces to survive org-mode fontification in polymode."
   (let ((inhibit-read-only t))
     (save-excursion
       ;; Insert before the input area
       (if claudemacs-agent--input-marker
           (goto-char claudemacs-agent--input-marker)
         (goto-char (point-max)))
-      (let ((start (point))
-            (text-to-insert (if face (propertize text 'face face) text)))
-        (insert text-to-insert)
+      (let ((start (point)))
+        (insert text)
         (let ((end (point)))
+          ;; Apply face via overlay (survives org fontification)
+          (when face
+            (let ((ov (make-overlay start end)))
+              (overlay-put ov 'face face)
+              (overlay-put ov 'priority 100)
+              (overlay-put ov 'evaporate t)
+              (overlay-put ov 'claudemacs-agent-styled t))
+            ;; Also apply to indirect buffers
+            (let ((base (current-buffer)))
+              (dolist (buf (buffer-list))
+                (when (and (buffer-live-p buf)
+                           (eq (buffer-base-buffer buf) base))
+                  (with-current-buffer buf
+                    (let ((ov (make-overlay start end)))
+                      (overlay-put ov 'face face)
+                      (overlay-put ov 'priority 100)
+                      (overlay-put ov 'evaporate t)
+                      (overlay-put ov 'claudemacs-agent-styled t)))))))
           ;; Update markers to stay at correct positions
           (when claudemacs-agent--input-marker
             (set-marker claudemacs-agent--input-marker end))
@@ -484,8 +501,16 @@
 (defun claudemacs-agent--generate-permission-pattern (tool-name tool-input scope)
   "Generate permission pattern for TOOL-NAME with TOOL-INPUT at SCOPE level."
   (pcase scope
-    ('once nil)  ; No pattern needed for once
+    ('once
+     ;; For once, create exact pattern for this specific request
+     (pcase tool-name
+       ("Read" (format "Read(%s)" (cdr (assq 'file_path tool-input))))
+       ("Write" (format "Write(%s)" (cdr (assq 'file_path tool-input))))
+       ("Edit" (format "Edit(%s)" (cdr (assq 'file_path tool-input))))
+       ("Bash" (format "Bash(%s)" (cdr (assq 'command tool-input))))
+       (_ (format "%s" tool-name))))
     ('session
+     ;; For session, same as once but tracked for cleanup
      (pcase tool-name
        ("Read" (format "Read(%s)" (cdr (assq 'file_path tool-input))))
        ("Write" (format "Write(%s)" (cdr (assq 'file_path tool-input))))
@@ -516,80 +541,235 @@
           (format "Bash(%s:*)" first-word)))
        (_ (format "%s(*)" tool-name))))))
 
+(defvar-local claudemacs-agent--permission-overlay nil
+  "Overlay for the permission dialog in the input area.")
+
+(defvar-local claudemacs-agent--permission-overlay-specs nil
+  "List of (start end face) specs for permission dialog overlays.")
+
+(defun claudemacs-agent--apply-permission-overlays ()
+  "Apply permission overlays in the current buffer using saved specs."
+  (when claudemacs-agent--permission-overlay-specs
+    ;; Remove existing permission overlays in this buffer
+    (dolist (ov (overlays-in (point-min) (point-max)))
+      (when (overlay-get ov 'claudemacs-permission-face)
+        (delete-overlay ov)))
+    ;; Apply new overlays
+    (dolist (spec claudemacs-agent--permission-overlay-specs)
+      (let ((ov (make-overlay (nth 0 spec) (nth 1 spec))))
+        (overlay-put ov 'face (nth 2 spec))
+        (overlay-put ov 'priority 1000)
+        (overlay-put ov 'evaporate nil)
+        (overlay-put ov 'claudemacs-permission-face t)))))
+
+(defun claudemacs-agent--render-permission-dialog ()
+  "Render the permission dialog with current selection state."
+  (when (and claudemacs-agent--permission-data
+             claudemacs-agent--input-marker
+             claudemacs-agent--prompt-marker)
+    (let* ((tool-name (cdr (assq 'tool_name claudemacs-agent--permission-data)))
+           (tool-input (cdr (assq 'tool_input claudemacs-agent--permission-data)))
+           (input-str (claudemacs-agent--format-tool-input tool-name tool-input))
+           (sel claudemacs-agent--permission-selection)
+           (inhibit-read-only t)
+           (options '("Allow once" "Allow for this session" "Always allow" "Deny"))
+           (overlay-specs nil))
+      ;; Remove existing permission overlays
+      (dolist (ov (overlays-in (point-min) (point-max)))
+        (when (overlay-get ov 'claudemacs-permission-face)
+          (delete-overlay ov)))
+      ;; Clear the input area and replace with dialog
+      (save-excursion
+        (delete-region claudemacs-agent--input-marker (point-max))
+        (goto-char claudemacs-agent--input-marker)
+        ;; Helper to insert and record overlay spec
+        (cl-flet ((insert-styled (text face)
+                    (let ((start (point)))
+                      (insert text)
+                      (push (list start (point) face) overlay-specs))))
+          ;; Header
+          (insert-styled "── Permission Request " 'claudemacs-agent-input-header-face)
+          (insert-styled (make-string 40 ?─) 'claudemacs-agent-input-header-face)
+          (insert "\n")
+          ;; Tool info
+          (insert-styled " Claude wants to run:\n" 'claudemacs-agent-session-face)
+          (insert-styled (format " %s %s\n\n" tool-name input-str) 'claudemacs-agent-tool-face)
+          ;; Options
+          (dotimes (i 4)
+            (let* ((selected (= i sel))
+                   (checkbox (if selected "[X]" "[ ]"))
+                   (label (nth i options))
+                   (face (if selected
+                             'claudemacs-agent-permission-selected-face
+                           'claudemacs-agent-permission-option-face)))
+              (insert-styled (format " %d. %s %s\n" (1+ i) checkbox label) face)))
+          ;; Footer
+          (insert-styled (make-string 62 ?─) 'claudemacs-agent-input-header-face)
+          (insert "\n")))
+      ;; Save overlay specs
+      (setq claudemacs-agent--permission-overlay-specs (nreverse overlay-specs))
+      ;; Apply overlays in this buffer
+      (claudemacs-agent--apply-permission-overlays)
+      ;; Apply overlays in all indirect buffers too
+      (let ((base (current-buffer)))
+        (dolist (buf (buffer-list))
+          (when (and (buffer-live-p buf)
+                     (eq (buffer-base-buffer buf) base))
+            (with-current-buffer buf
+              (setq claudemacs-agent--permission-overlay-specs
+                    (buffer-local-value 'claudemacs-agent--permission-overlay-specs base))
+              (claudemacs-agent--apply-permission-overlays)))))
+      ;; Update prompt marker to end
+      (set-marker claudemacs-agent--prompt-marker (point-max)))))
+
 (defun claudemacs-agent--show-permission-prompt (data)
-  "Show permission prompt for DATA in the buffer."
+  "Show permission prompt for DATA in the input area."
   (setq claudemacs-agent--permission-data data)
   (setq claudemacs-agent--permission-selection 0)
-  (let* ((tool-name (cdr (assq 'tool_name data)))
-         (tool-input (cdr (assq 'tool_input data)))
-         (input-str (claudemacs-agent--format-tool-input tool-name tool-input))
-         (inhibit-read-only t))
-    ;; Append permission prompt to output
-    (claudemacs-agent--append-output
-     (format "\n┌─ Permission Request ─────────────────────────────────┐\n")
-     'claudemacs-agent-permission-box-face)
-    (claudemacs-agent--append-output
-     (format "│ Claude wants to run: %-34s │\n" tool-name)
-     'claudemacs-agent-permission-box-face)
-    (claudemacs-agent--append-output
-     (format "│ %-53s │\n" (truncate-string-to-width input-str 53))
-     'claudemacs-agent-permission-box-face)
-    (claudemacs-agent--append-output
-     "│                                                       │\n"
-     'claudemacs-agent-permission-box-face)
-    (claudemacs-agent--append-output
-     "│  [1] Allow once    [2] Allow session                  │\n"
-     'claudemacs-agent-permission-box-face)
-    (claudemacs-agent--append-output
-     "│  [3] Always allow  [4] Deny                           │\n"
-     'claudemacs-agent-permission-box-face)
-    (claudemacs-agent--append-output
-     "└───────────────────────────────────────────────────────┘\n"
-     'claudemacs-agent-permission-box-face)
-    ;; Set up temporary keymap for selection
-    (claudemacs-agent--setup-permission-keymap)))
+  ;; Render the dialog
+  (claudemacs-agent--render-permission-dialog)
+  ;; Set up keyboard navigation
+  (claudemacs-agent--setup-permission-keymap))
 
-(defun claudemacs-agent--setup-permission-keymap ()
-  "Set up keymap for permission prompt interaction."
+(defun claudemacs-agent--with-base-buffer (&rest body)
+  "Execute BODY in the base buffer (for polymode compatibility)."
+  (let ((base (or (buffer-base-buffer) (current-buffer))))
+    (with-current-buffer base
+      (eval (cons 'progn body)))))
+
+(defmacro claudemacs-agent--in-base-buffer (&rest body)
+  "Execute BODY in the base buffer (for polymode compatibility)."
+  `(let ((base (or (buffer-base-buffer) (current-buffer))))
+     (with-current-buffer base
+       ,@body)))
+
+(defun claudemacs-agent--permission-select-next ()
+  "Move selection down in permission dialog."
+  (interactive)
+  (claudemacs-agent--in-base-buffer
+   (when claudemacs-agent--permission-data
+     (setq claudemacs-agent--permission-selection
+           (mod (1+ claudemacs-agent--permission-selection) 4))
+     (claudemacs-agent--render-permission-dialog))))
+
+(defun claudemacs-agent--permission-select-prev ()
+  "Move selection up in permission dialog."
+  (interactive)
+  (claudemacs-agent--in-base-buffer
+   (when claudemacs-agent--permission-data
+     (setq claudemacs-agent--permission-selection
+           (mod (1- claudemacs-agent--permission-selection) 4))
+     (claudemacs-agent--render-permission-dialog))))
+
+(defun claudemacs-agent--permission-confirm ()
+  "Confirm the current selection in permission dialog."
+  (interactive)
+  (claudemacs-agent--in-base-buffer
+   (when claudemacs-agent--permission-data
+     (pcase claudemacs-agent--permission-selection
+       (0 (claudemacs-agent--send-permission-response "allow_once"))
+       (1 (claudemacs-agent--send-permission-response "allow_session"))
+       (2 (claudemacs-agent--send-permission-response "allow_always"))
+       (3 (claudemacs-agent--send-permission-response "deny"))))))
+
+;; Minor mode for permission dialog - takes precedence over evil-mode
+(defvar claudemacs-agent-permission-mode-map
   (let ((map (make-sparse-keymap)))
+    ;; Number keys for direct selection
     (define-key map (kbd "1") #'claudemacs-agent-permit-once)
     (define-key map (kbd "2") #'claudemacs-agent-permit-session)
     (define-key map (kbd "3") #'claudemacs-agent-permit-always)
     (define-key map (kbd "4") #'claudemacs-agent-deny)
+    ;; Arrow keys for navigation
+    (define-key map (kbd "<up>") #'claudemacs-agent--permission-select-prev)
+    (define-key map (kbd "<down>") #'claudemacs-agent--permission-select-next)
+    (define-key map (kbd "C-p") #'claudemacs-agent--permission-select-prev)
+    (define-key map (kbd "C-n") #'claudemacs-agent--permission-select-next)
+    (define-key map (kbd "k") #'claudemacs-agent--permission-select-prev)
+    (define-key map (kbd "j") #'claudemacs-agent--permission-select-next)
+    ;; Confirm selection
+    (define-key map (kbd "RET") #'claudemacs-agent--permission-confirm)
+    (define-key map (kbd "SPC") #'claudemacs-agent--permission-confirm)
+    ;; Quick keys
     (define-key map (kbd "y") #'claudemacs-agent-permit-once)
     (define-key map (kbd "n") #'claudemacs-agent-deny)
     (define-key map (kbd "a") #'claudemacs-agent-permit-always)
-    (define-key map (kbd "RET") #'claudemacs-agent-permit-once)
     (define-key map (kbd "q") #'claudemacs-agent-deny)
-    ;; Set as minor mode map temporarily
-    (setq-local claudemacs-agent--permission-keymap map)
-    (use-local-map (make-composed-keymap map claudemacs-agent-base-mode-map))
-    (message "Permission: [1]once [2]session [3]always [4/n]deny")))
+    ;; Escape to deny (helpful for evil users)
+    (define-key map (kbd "<escape>") #'claudemacs-agent-deny)
+    map)
+  "Keymap for permission dialog mode.")
+
+(define-minor-mode claudemacs-agent-permission-mode
+  "Minor mode for permission dialog interaction.
+Takes precedence over evil-mode keybindings."
+  :lighter " Permit"
+  :keymap claudemacs-agent-permission-mode-map
+  (if claudemacs-agent-permission-mode
+      (progn
+        ;; Switch to emacs state to use our keymap directly
+        (when (bound-and-true-p evil-local-mode)
+          (evil-emacs-state))
+        (message "Permission: j/k to select, RET to confirm, 1-4 for direct choice"))
+    ;; When disabling, return to normal state
+    (when (bound-and-true-p evil-local-mode)
+      (evil-normal-state))))
+
+(defun claudemacs-agent--setup-permission-keymap ()
+  "Set up keymap for permission prompt interaction."
+  ;; Enable permission mode in the base buffer
+  (claudemacs-agent-permission-mode 1)
+  ;; For polymode: also enable in all indirect buffers sharing this base
+  (let ((base (or (buffer-base-buffer) (current-buffer))))
+    (dolist (buf (buffer-list))
+      (when (and (buffer-live-p buf)
+                 (eq (buffer-base-buffer buf) base))
+        (with-current-buffer buf
+          (claudemacs-agent-permission-mode 1))))))
 
 (defun claudemacs-agent--send-permission-response (action)
   "Send permission response with ACTION to the agent process."
-  (when claudemacs-agent--permission-data
-    (let* ((tool-name (cdr (assq 'tool_name claudemacs-agent--permission-data)))
-           (tool-input (cdr (assq 'tool_input claudemacs-agent--permission-data)))
-           (scope (pcase action
-                    ("allow_once" 'once)
-                    ("allow_session" 'session)
-                    ("allow_always" 'always)
-                    (_ nil)))
-           (pattern (when scope
-                      (claudemacs-agent--generate-permission-pattern
-                       tool-name tool-input scope)))
-           (response (json-encode `((action . ,action)
-                                    (pattern . ,pattern)))))
-      ;; Clear permission state
-      (setq claudemacs-agent--permission-data nil)
-      ;; Restore normal keymap
-      (use-local-map claudemacs-agent-base-mode-map)
-      ;; Send response to process
-      (when (and claudemacs-agent--process
-                 (process-live-p claudemacs-agent--process))
-        (process-send-string claudemacs-agent--process
-                             (format "/permit %s\n" response))))))
+  (claudemacs-agent--in-base-buffer
+   (when claudemacs-agent--permission-data
+     (let* ((tool-name (cdr (assq 'tool_name claudemacs-agent--permission-data)))
+            (tool-input (cdr (assq 'tool_input claudemacs-agent--permission-data)))
+            (scope (pcase action
+                     ("allow_once" 'once)
+                     ("allow_session" 'session)
+                     ("allow_always" 'always)
+                     (_ nil)))
+            (pattern (when scope
+                       (claudemacs-agent--generate-permission-pattern
+                        tool-name tool-input scope)))
+            (response (json-encode `((action . ,action)
+                                     (pattern . ,pattern)))))
+       ;; Clear permission state and disable minor mode in all related buffers
+       (setq claudemacs-agent--permission-data nil)
+       (setq claudemacs-agent--permission-overlay-specs nil)
+       (claudemacs-agent-permission-mode -1)
+       ;; For polymode: also disable in all indirect buffers sharing this base
+       (let ((base (current-buffer)))
+         (dolist (buf (buffer-list))
+           (when (and (buffer-live-p buf)
+                      (eq (buffer-base-buffer buf) base))
+             (with-current-buffer buf
+               (claudemacs-agent-permission-mode -1)
+               ;; Clear permission overlays in indirect buffers too
+               (dolist (ov (overlays-in (point-min) (point-max)))
+                 (when (overlay-get ov 'claudemacs-permission-face)
+                   (delete-overlay ov)))))))
+       ;; Clear permission overlays in base buffer
+       (dolist (ov (overlays-in (point-min) (point-max)))
+         (when (overlay-get ov 'claudemacs-permission-face)
+           (delete-overlay ov)))
+       ;; Restore input area and show thinking status
+       (claudemacs-agent--setup-input-area)
+       (claudemacs-agent--set-status "Processing...")
+       ;; Send response to process
+       (when (and claudemacs-agent--process
+                  (process-live-p claudemacs-agent--process))
+         (process-send-string claudemacs-agent--process
+                              (format "/permit %s\n" response)))))))
 
 (defun claudemacs-agent-permit-once ()
   "Allow the tool to run once."
