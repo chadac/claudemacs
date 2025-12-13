@@ -34,12 +34,15 @@ MARKER_USER_END = "[/USER]"
 MARKER_ASSISTANT_START = "[ASSISTANT]"
 MARKER_ASSISTANT_END = "[/ASSISTANT]"
 MARKER_TOOL_START = "[TOOL "  # followed by tool name and ]
+MARKER_TOOL_RESULT_START = "[TOOL_RESULT]"
+MARKER_TOOL_RESULT_END = "[/TOOL_RESULT]"
 MARKER_TOOL_END = "[/TOOL]"
 MARKER_READY = "[READY]"
 MARKER_ERROR_START = "[ERROR]"
 MARKER_ERROR_END = "[/ERROR]"
 MARKER_SESSION_START = "[SESSION]"
 MARKER_SESSION_END = "[/SESSION]"
+MARKER_SESSION_INFO = "[SESSION_INFO "  # followed by JSON and ] - model/session_id updates
 MARKER_THINKING = "[THINKING]"  # Signals Claude is processing
 MARKER_PROGRESS = "[PROGRESS "  # followed by JSON and ]
 MARKER_RESULT = "[RESULT "  # followed by JSON and ]
@@ -140,12 +143,55 @@ class ClaudeEmacsAgent:
         try:
             _make_stdout_blocking()
             print(message, flush=True)
+            sys.stdout.flush()  # Extra flush to ensure delivery
         except (BlockingIOError, BrokenPipeError, OSError) as e:
             sys.stderr.write(f"Failed to emit: {e}\n")
 
     def _emit_ready(self) -> None:
         """Emit the ready marker to signal ready for input."""
+        self._log_json("EMIT", {"marker": "READY"})
         self._emit(MARKER_READY)
+
+    def _emit_session_info(self, model: Optional[str] = None, session_id: Optional[str] = None) -> None:
+        """Emit session info marker with model and session_id."""
+        info = {}
+        if model:
+            info["model"] = model
+            self.state.model = model
+        if session_id:
+            info["session_id"] = session_id
+            self.state.session_id = session_id
+        if info:
+            self._emit(f"{MARKER_SESSION_INFO}{json.dumps(info)}]")
+
+    def _format_tool_args(self, tool_name: str, tool_input: dict) -> str:
+        """Format tool input for display as function-style args."""
+        if tool_name in ("Read", "Write", "Edit"):
+            return tool_input.get("file_path", "")
+        elif tool_name == "Bash":
+            cmd = tool_input.get("command", "")
+            # Truncate long commands
+            if len(cmd) > 60:
+                return cmd[:57] + "..."
+            return cmd
+        elif tool_name == "Glob":
+            return tool_input.get("pattern", "")
+        elif tool_name == "Grep":
+            pattern = tool_input.get("pattern", "")
+            path = tool_input.get("path", "")
+            if path:
+                return f"{pattern}, {path}"
+            return pattern
+        elif tool_name == "WebFetch":
+            return tool_input.get("url", "")
+        elif tool_name == "Task":
+            return tool_input.get("description", "")[:40]
+        else:
+            # For unknown tools, show first key=value
+            for k, v in tool_input.items():
+                val = str(v)[:40]
+                return f"{k}={val}"
+            return ""
 
     def _matches_permission(self, tool_name: str, tool_input: dict) -> bool:
         """Check if this tool use matches any allowed permission pattern."""
@@ -348,7 +394,20 @@ class ClaudeEmacsAgent:
                 self._log_json("RECV", {"type": type(msg).__name__, "data": str(msg)[:200]})
                 msg_type = type(msg).__name__
 
-                if msg_type == "AssistantMessage":
+                if msg_type == "SystemMessage":
+                    # Init message with model and session info
+                    data = getattr(msg, "data", {})
+                    model = data.get("model")
+                    session_id = data.get("session_id")
+                    if model or session_id:
+                        self._emit_session_info(model=model, session_id=session_id)
+
+                elif msg_type == "AssistantMessage":
+                    # Extract model if available
+                    model = getattr(msg, "model", None)
+                    if model and model != self.state.model:
+                        self._emit_session_info(model=model)
+
                     # Handle content blocks in the assistant message
                     for block in getattr(msg, "content", []):
                         block_type = type(block).__name__
@@ -366,13 +425,11 @@ class ClaudeEmacsAgent:
                                 self._emit(f"{MARKER_ASSISTANT_END}")
                                 in_assistant_block = False
                             tool_name = getattr(block, "name", "unknown")
+                            tool_input = getattr(block, "input", {})
                             current_tool = tool_name
-                            self._emit(f"{MARKER_TOOL_START}{tool_name}]")
-
-                        elif block_type == "ToolResultBlock":
-                            if current_tool:
-                                self._emit(f"{MARKER_TOOL_END}")
-                                current_tool = None
+                            # Format tool args for display
+                            tool_args = self._format_tool_args(tool_name, tool_input)
+                            self._emit(f"{MARKER_TOOL_START}{tool_name} {tool_args}]")
 
                     # Update token counts if available
                     usage = getattr(msg, "usage", None)
@@ -385,6 +442,33 @@ class ClaudeEmacsAgent:
                         }
                         self._emit(f"{MARKER_PROGRESS}{json.dumps(progress)}]")
 
+                elif msg_type == "UserMessage":
+                    # UserMessage contains tool results
+                    for block in getattr(msg, "content", []):
+                        block_type = type(block).__name__
+
+                        if block_type == "ToolResultBlock":
+                            # Emit tool result content
+                            content = getattr(block, "content", None)
+                            if content:
+                                self._emit(f"{MARKER_TOOL_RESULT_START}")
+                                # Content can be a string or list of content blocks
+                                if isinstance(content, str):
+                                    self._emit(content)
+                                elif isinstance(content, list):
+                                    for item in content:
+                                        if hasattr(item, "text"):
+                                            self._emit(item.text)
+                                        elif isinstance(item, dict) and "text" in item:
+                                            self._emit(item["text"])
+                                        elif isinstance(item, str):
+                                            self._emit(item)
+                                self._emit(f"{MARKER_TOOL_RESULT_END}")
+                            # Close the tool block
+                            if current_tool:
+                                self._emit(f"{MARKER_TOOL_END}")
+                                current_tool = None
+
                 elif msg_type == "ResultMessage":
                     # Conversation turn complete
                     if in_assistant_block:
@@ -394,15 +478,22 @@ class ClaudeEmacsAgent:
                         self._emit(f"{MARKER_TOOL_END}")
                         current_tool = None
 
+                    # Get cost and session info
+                    cost = getattr(msg, "total_cost_usd", None) or getattr(msg, "cost_usd", 0) or 0
+                    session_id = getattr(msg, "session_id", None)
+
                     # Emit final stats
                     result_info = {
-                        "cost_usd": getattr(msg, "cost_usd", 0) or 0,
+                        "cost_usd": cost,
                         "duration_ms": getattr(msg, "duration_ms", 0) or 0,
                         "num_turns": getattr(msg, "num_turns", 0) or 0,
                         "total_output": total_output_tokens,
                         "total_input": total_input_tokens,
                     }
                     self._emit(f"{MARKER_RESULT}{json.dumps(result_info)}]")
+                    # ResultMessage signals end of turn - break out of loop
+                    self._log_json("DEBUG", {"action": "breaking out of receive_messages loop"})
+                    break
 
         except Exception as e:
             self._emit(f"{MARKER_ERROR_START}")
@@ -412,6 +503,8 @@ class ClaudeEmacsAgent:
 
         self.state.status = "ready"
         self._emit_ready()
+        # Small yield to ensure output is flushed before returning to event loop
+        await asyncio.sleep(0.01)
 
     async def interrupt(self) -> None:
         """Interrupt the current Claude operation."""
@@ -473,13 +566,37 @@ async def run_agent(
 
     # Task to read stdin and dispatch commands
     async def read_stdin():
+        input_buffer: list[str] = []  # Buffer for multi-line [INPUT]...[/INPUT] messages
+        in_input_block = False
+
         while agent._running:
             try:
                 line = await reader.readline()
                 if not line:
                     break
 
-                text = line.decode().strip()
+                text = line.decode().rstrip('\n\r')
+
+                # Handle [INPUT] block framing for multi-line messages
+                if text == "[INPUT]":
+                    in_input_block = True
+                    input_buffer = []
+                    continue
+                elif text == "[/INPUT]":
+                    in_input_block = False
+                    # Join accumulated lines and queue as single message
+                    full_message = "\n".join(input_buffer)
+                    if full_message.strip():
+                        await message_queue.put(full_message)
+                    input_buffer = []
+                    continue
+                elif in_input_block:
+                    # Accumulate lines within [INPUT] block
+                    input_buffer.append(text)
+                    continue
+
+                # Skip empty lines outside of input blocks
+                text = text.strip()
                 if not text:
                     continue
 
@@ -500,7 +617,7 @@ async def run_agent(
                         agent._emit(f"Invalid permission response: {e}")
                         agent._emit(f"{MARKER_ERROR_END}")
                 else:
-                    # Queue regular messages for processing
+                    # Queue regular messages for processing (legacy single-line support)
                     await message_queue.put(text)
 
             except Exception as e:
