@@ -151,6 +151,16 @@
 (defvar-local claudemacs-agent--has-conversation nil
   "Non-nil if conversation has started (first message sent).")
 
+(defvar-local claudemacs-agent--placeholder-overlay nil
+  "Overlay for the placeholder text in empty input area.")
+
+(defconst claudemacs-agent--placeholder-text "Enter your message... (C-c C-c to send)"
+  "Placeholder text shown when input area is empty.")
+
+(defface claudemacs-agent-placeholder-face
+  '((t :foreground "#5c6370" :slant italic))
+  "Face for placeholder text in empty input area."
+  :group 'claudemacs-agent)
 
 ;;;; Mode definition
 
@@ -185,7 +195,9 @@ Uses org-mode fontification without org-mode keybindings."
   (local-set-key (kbd "C-c C-k") #'claudemacs-agent-interrupt)
   (local-set-key (kbd "C-c C-q") #'claudemacs-agent-quit)
   (local-set-key (kbd "M-p") #'claudemacs-agent-previous-input)
-  (local-set-key (kbd "M-n") #'claudemacs-agent-next-input))
+  (local-set-key (kbd "M-n") #'claudemacs-agent-next-input)
+  ;; Set up placeholder update hook
+  (add-hook 'post-command-hook #'claudemacs-agent--post-command-hook nil t))
 
 ;;;; Helper functions
 
@@ -199,6 +211,47 @@ Uses org-mode fontification without org-mode keybindings."
   `(let ((base (or (buffer-base-buffer) (current-buffer))))
      (with-current-buffer base
        ,@body)))
+
+;;;; Placeholder management
+
+(defun claudemacs-agent--input-empty-p ()
+  "Return t if the input area is empty (only whitespace)."
+  (and claudemacs-agent--prompt-marker
+       ;; string-blank-p returns match position (0) for empty, so convert to t
+       (not (null (string-blank-p (buffer-substring-no-properties
+                                   claudemacs-agent--prompt-marker (point-max)))))))
+
+(defun claudemacs-agent--update-placeholder ()
+  "Show or hide placeholder based on input area content."
+  (when (and claudemacs-agent--prompt-marker
+             (marker-position claudemacs-agent--prompt-marker))
+    (if (claudemacs-agent--input-empty-p)
+        ;; Show placeholder - use before-string so cursor appears after it
+        (unless (and claudemacs-agent--placeholder-overlay
+                     (overlay-buffer claudemacs-agent--placeholder-overlay))
+          (setq claudemacs-agent--placeholder-overlay
+                (make-overlay claudemacs-agent--prompt-marker
+                              claudemacs-agent--prompt-marker))
+          (overlay-put claudemacs-agent--placeholder-overlay 'before-string
+                       (propertize claudemacs-agent--placeholder-text
+                                   'face 'claudemacs-agent-placeholder-face
+                                   'cursor t))  ; Allow cursor to appear in string
+          (overlay-put claudemacs-agent--placeholder-overlay 'evaporate nil))
+      ;; Hide placeholder
+      (when (and claudemacs-agent--placeholder-overlay
+                 (overlay-buffer claudemacs-agent--placeholder-overlay))
+        (delete-overlay claudemacs-agent--placeholder-overlay)
+        (setq claudemacs-agent--placeholder-overlay nil)))))
+
+(defun claudemacs-agent--post-command-hook ()
+  "Hook run after each command to update placeholder visibility.
+Also moves point to prompt marker when input area is empty."
+  (claudemacs-agent--update-placeholder)
+  ;; If input is empty and we're in the input area, keep cursor at prompt
+  (when (and (claudemacs-agent--input-empty-p)
+             (claudemacs-agent--in-input-area-p)
+             claudemacs-agent--prompt-marker)
+    (goto-char claudemacs-agent--prompt-marker)))
 
 ;;;; Section management
 
@@ -652,6 +705,9 @@ that doesn't break org syntax (like org-indent-mode)."
 
     ;; Update read-only protection
     (claudemacs-agent--update-read-only)
+
+    ;; Show placeholder if input is empty
+    (claudemacs-agent--update-placeholder)
 
     ;; Move point to input area
     (goto-char claudemacs-agent--prompt-marker)
