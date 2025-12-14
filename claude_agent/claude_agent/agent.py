@@ -1,12 +1,7 @@
 """Claude Agent - Wrapper using Claude Agent SDK with dynamic permissions.
 
-Outputs structured markers that Emacs can parse to format the conversation nicely:
-- [USER] ... [/USER] for echoing user input
-- [ASSISTANT] ... [/ASSISTANT] for Claude's responses
-- [TOOL name] ... [/TOOL] for tool calls
-- [STATUS model cost] for status updates
-- [READY] to signal ready for input
-- [ERROR] ... [/ERROR] for errors
+Outputs newline-delimited JSON messages for Emacs to parse.
+See protocol.py for message type definitions.
 """
 
 import asyncio
@@ -26,30 +21,6 @@ from claude_agent_sdk import (
     PermissionResultAllow,
     PermissionResultDeny,
 )
-
-
-# Markers for Emacs to parse
-MARKER_USER_START = "[USER]"
-MARKER_USER_END = "[/USER]"
-MARKER_ASSISTANT_START = "[ASSISTANT]"
-MARKER_ASSISTANT_END = "[/ASSISTANT]"
-MARKER_TOOL_START = "[TOOL "  # followed by tool name and ]
-MARKER_TOOL_RESULT_START = "[TOOL_RESULT]"
-MARKER_TOOL_RESULT_END = "[/TOOL_RESULT]"
-MARKER_TOOL_END = "[/TOOL]"
-MARKER_READY = "[READY]"
-MARKER_ERROR_START = "[ERROR]"
-MARKER_ERROR_END = "[/ERROR]"
-MARKER_SESSION_START = "[SESSION]"
-MARKER_SESSION_END = "[/SESSION]"
-MARKER_SESSION_INFO = "[SESSION_INFO "  # followed by JSON and ] - model/session_id updates
-MARKER_THINKING = "[THINKING]"  # Signals Claude is processing
-MARKER_PROGRESS = "[PROGRESS "  # followed by JSON and ]
-MARKER_RESULT = "[RESULT "  # followed by JSON and ]
-MARKER_PERMISSION_REQUEST = "[PERMISSION_REQUEST "  # followed by JSON and ]
-MARKER_EDIT = "[EDIT "  # followed by JSON with file_path, old_string, new_string
-MARKER_WRITE = "[WRITE "  # followed by JSON with file_path, content
-MARKER_MCP_STATUS = "[MCP_STATUS "  # followed by JSON array of {name, status} and ]
 
 
 def _format_traceback() -> str:
@@ -143,31 +114,47 @@ class ClaudeAgent:
             self._log_handle.write(f"[{timestamp}] {direction}: {json.dumps(msg)}\n")
             self._log_handle.flush()
 
-    def _emit(self, message: str) -> None:
-        """Send message to Emacs (stdout)."""
+    def _emit(self, msg: dict) -> None:
+        """Send JSON message to Emacs (stdout as NDJSON)."""
         try:
             _make_stdout_blocking()
-            print(message, flush=True)
+            json_str = json.dumps(msg, ensure_ascii=False)
+            print(json_str, flush=True)
             sys.stdout.flush()  # Extra flush to ensure delivery
+            self._log_json("EMIT", msg)
         except (BlockingIOError, BrokenPipeError, OSError) as e:
             sys.stderr.write(f"Failed to emit: {e}\n")
 
     def _emit_ready(self) -> None:
-        """Emit the ready marker to signal ready for input."""
-        self._log_json("EMIT", {"marker": "READY"})
-        self._emit(MARKER_READY)
+        """Emit the ready message to signal ready for input."""
+        self._emit({"type": "ready"})
 
     def _emit_session_info(self, model: Optional[str] = None, session_id: Optional[str] = None) -> None:
-        """Emit session info marker with model and session_id."""
-        info = {}
+        """Emit session info message with model and session_id."""
         if model:
-            info["model"] = model
             self.state.model = model
         if session_id:
-            info["session_id"] = session_id
             self.state.session_id = session_id
-        if info:
-            self._emit(f"{MARKER_SESSION_INFO}{json.dumps(info)}]")
+        if model or session_id:
+            self._emit({
+                "type": "session_info",
+                "model": model,
+                "session_id": session_id,
+            })
+
+    def _emit_error(self, message: str, tb: Optional[str] = None) -> None:
+        """Emit error message."""
+        self._emit({
+            "type": "error",
+            "message": message,
+            "traceback": tb,
+        })
+
+    def _emit_session_message(self, text: str) -> None:
+        """Emit a session info message (for system notifications)."""
+        self._emit({"type": "session_message_start"})
+        self._emit({"type": "session_message_text", "text": text})
+        self._emit({"type": "session_message_end"})
 
     def _filter_system_reminders(self, text: str) -> str:
         """Remove <system-reminder>...</system-reminder> blocks from text."""
@@ -284,7 +271,11 @@ class ClaudeAgent:
             "tool_name": tool_name,
             "tool_input": tool_input,
         }
-        self._emit(f"{MARKER_PERMISSION_REQUEST}{json.dumps(self._pending_permission_request)}]")
+        self._emit({
+            "type": "permission_request",
+            "tool_name": tool_name,
+            "tool_input": tool_input,
+        })
 
         # Wait for user response via stdin
         self._permission_event = asyncio.Event()
@@ -294,9 +285,7 @@ class ClaudeAgent:
             # Wait for permission response (with timeout)
             await asyncio.wait_for(self._permission_event.wait(), timeout=300.0)
         except asyncio.TimeoutError:
-            self._emit(f"{MARKER_SESSION_START}")
-            self._emit("Permission request timed out")
-            self._emit(f"{MARKER_SESSION_END}")
+            self._emit_session_message("Permission request timed out")
             return PermissionResultDeny()
 
         response = self._permission_response
@@ -318,15 +307,24 @@ class ClaudeAgent:
             if action == "allow_always":
                 self.state.always_permissions.add(pattern)
                 self._save_permission(pattern)
-                self._emit(f"{MARKER_SESSION_START}")
-                self._emit(f"Added permanent permission: {pattern}")
-                self._emit(f"{MARKER_SESSION_END}")
+                self._emit({
+                    "type": "permission_granted",
+                    "pattern": pattern,
+                    "scope": "always",
+                })
             elif action == "allow_session":
                 self.state.session_permissions.add(pattern)
-                self._emit(f"{MARKER_SESSION_START}")
-                self._emit(f"Added session permission: {pattern}")
-                self._emit(f"{MARKER_SESSION_END}")
-            # allow_once doesn't add to any set, just allows this one use
+                self._emit({
+                    "type": "permission_granted",
+                    "pattern": pattern,
+                    "scope": "session",
+                })
+            elif action == "allow_once":
+                self._emit({
+                    "type": "permission_granted",
+                    "pattern": pattern,
+                    "scope": "once",
+                })
 
         return PermissionResultAllow()
 
@@ -352,9 +350,7 @@ class ClaudeAgent:
                 with open(settings_path, "w") as f:
                     json.dump(settings, f, indent=2)
         except Exception as e:
-            self._emit(f"{MARKER_ERROR_START}")
-            self._emit(f"Failed to save permission: {e}")
-            self._emit(f"{MARKER_ERROR_END}")
+            self._emit_error(f"Failed to save permission: {e}")
 
     def handle_permission_response(self, response: dict) -> None:
         """Handle permission response from Emacs (called from stdin reader)."""
@@ -386,10 +382,10 @@ class ClaudeAgent:
         if not self._client:
             await self.connect()
 
-        # Echo the user message back with markers
-        self._emit(f"{MARKER_USER_START}")
-        self._emit(message)
-        self._emit(f"{MARKER_USER_END}")
+        # Echo the user message back
+        self._emit({"type": "user_start"})
+        self._emit({"type": "user_text", "text": message})
+        self._emit({"type": "user_end"})
 
         # Add org-mode reminder periodically (every 10 messages, starting with first)
         self.state.message_count += 1
@@ -399,7 +395,7 @@ class ClaudeAgent:
             full_message = message
 
         self.state.status = "thinking"
-        self._emit(MARKER_THINKING)
+        self._emit({"type": "thinking", "status": "Thinking..."})
 
         try:
             # Send the query
@@ -426,7 +422,10 @@ class ClaudeAgent:
                     # Emit MCP server status if available
                     mcp_servers = data.get("mcp_servers", [])
                     if mcp_servers:
-                        self._emit(f"{MARKER_MCP_STATUS}{json.dumps(mcp_servers)}]")
+                        self._emit({
+                            "type": "mcp_status",
+                            "servers": mcp_servers,
+                        })
 
                 elif msg_type == "AssistantMessage":
                     # Extract model if available
@@ -442,13 +441,13 @@ class ClaudeAgent:
                             text = getattr(block, "text", "")
                             if text:
                                 if not in_assistant_block:
-                                    self._emit(f"{MARKER_ASSISTANT_START}")
+                                    self._emit({"type": "assistant_start"})
                                     in_assistant_block = True
-                                self._emit(text)
+                                self._emit({"type": "assistant_text", "text": text})
 
                         elif block_type == "ToolUseBlock":
                             if in_assistant_block:
-                                self._emit(f"{MARKER_ASSISTANT_END}")
+                                self._emit({"type": "assistant_end"})
                                 in_assistant_block = False
                             tool_name = getattr(block, "name", "unknown")
                             tool_input = getattr(block, "input", {})
@@ -456,34 +455,43 @@ class ClaudeAgent:
 
                             # Special handling for Edit tool - emit diff info
                             if tool_name == "Edit":
-                                edit_info = {
+                                self._emit({
+                                    "type": "edit_tool",
                                     "file_path": tool_input.get("file_path", ""),
                                     "old_string": tool_input.get("old_string", ""),
                                     "new_string": tool_input.get("new_string", ""),
-                                }
-                                self._emit(f"{MARKER_EDIT}{json.dumps(edit_info)}]")
+                                })
                             # Special handling for Write tool - emit content for diff
                             elif tool_name == "Write":
-                                write_info = {
+                                self._emit({
+                                    "type": "write_tool",
                                     "file_path": tool_input.get("file_path", ""),
                                     "content": tool_input.get("content", ""),
-                                }
-                                self._emit(f"{MARKER_WRITE}{json.dumps(write_info)}]")
+                                })
                             else:
-                                # Format tool args for display
+                                # Emit tool call
+                                self._emit({
+                                    "type": "tool_call",
+                                    "name": tool_name,
+                                    "input": tool_input,
+                                })
+                                # Also emit thinking status for tool execution
                                 tool_args = self._format_tool_args(tool_name, tool_input)
-                                self._emit(f"{MARKER_TOOL_START}{tool_name} {tool_args}]")
+                                self._emit({
+                                    "type": "thinking",
+                                    "status": f"Running: {tool_name}({tool_args})",
+                                })
 
                     # Update token counts if available
                     usage = getattr(msg, "usage", None)
                     if usage:
                         total_output_tokens = getattr(usage, "output_tokens", 0)
                         total_input_tokens = getattr(usage, "input_tokens", 0)
-                        progress = {
-                            "output_tokens": total_output_tokens,
+                        self._emit({
+                            "type": "progress",
                             "input_tokens": total_input_tokens,
-                        }
-                        self._emit(f"{MARKER_PROGRESS}{json.dumps(progress)}]")
+                            "output_tokens": total_output_tokens,
+                        })
 
                 elif msg_type == "UserMessage":
                     # UserMessage contains tool results
@@ -493,32 +501,40 @@ class ClaudeAgent:
                         if block_type == "ToolResultBlock":
                             # Emit tool result content
                             content = getattr(block, "content", None)
+                            is_error = getattr(block, "is_error", False)
+                            result_text = ""
                             if content:
-                                self._emit(f"{MARKER_TOOL_RESULT_START}")
                                 # Content can be a string or list of content blocks
                                 if isinstance(content, str):
-                                    self._emit(self._filter_system_reminders(content))
+                                    result_text = self._filter_system_reminders(content)
                                 elif isinstance(content, list):
+                                    parts = []
                                     for item in content:
                                         if hasattr(item, "text"):
-                                            self._emit(self._filter_system_reminders(item.text))
+                                            parts.append(self._filter_system_reminders(item.text))
                                         elif isinstance(item, dict) and "text" in item:
-                                            self._emit(self._filter_system_reminders(item["text"]))
+                                            parts.append(self._filter_system_reminders(item["text"]))
                                         elif isinstance(item, str):
-                                            self._emit(self._filter_system_reminders(item))
-                                self._emit(f"{MARKER_TOOL_RESULT_END}")
-                            # Close the tool block
+                                            parts.append(self._filter_system_reminders(item))
+                                    result_text = "\n".join(parts)
+
+                            self._emit({
+                                "type": "tool_result",
+                                "content": result_text,
+                                "is_error": is_error,
+                            })
+                            # Close the tool
                             if current_tool:
-                                self._emit(f"{MARKER_TOOL_END}")
+                                self._emit({"type": "tool_end"})
                                 current_tool = None
 
                 elif msg_type == "ResultMessage":
                     # Conversation turn complete
                     if in_assistant_block:
-                        self._emit(f"{MARKER_ASSISTANT_END}")
+                        self._emit({"type": "assistant_end"})
                         in_assistant_block = False
                     if current_tool:
-                        self._emit(f"{MARKER_TOOL_END}")
+                        self._emit({"type": "tool_end"})
                         current_tool = None
 
                     # Get cost and session info
@@ -526,23 +542,20 @@ class ClaudeAgent:
                     session_id = getattr(msg, "session_id", None)
 
                     # Emit final stats
-                    result_info = {
+                    self._emit({
+                        "type": "result",
                         "cost_usd": cost,
                         "duration_ms": getattr(msg, "duration_ms", 0) or 0,
                         "num_turns": getattr(msg, "num_turns", 0) or 0,
-                        "total_output": total_output_tokens,
                         "total_input": total_input_tokens,
-                    }
-                    self._emit(f"{MARKER_RESULT}{json.dumps(result_info)}]")
+                        "total_output": total_output_tokens,
+                    })
                     # ResultMessage signals end of turn - break out of loop
                     self._log_json("DEBUG", {"action": "breaking out of receive_messages loop"})
                     break
 
         except Exception as e:
-            self._emit(f"{MARKER_ERROR_START}")
-            self._emit(f"Error: {e}")
-            self._emit(f"{MARKER_ERROR_END}")
-            self._log_json("ERROR", {"error": str(e), "traceback": _format_traceback()})
+            self._emit_error(str(e), _format_traceback())
 
         self.state.status = "ready"
         self._emit_ready()
@@ -556,9 +569,7 @@ class ClaudeAgent:
                 await self._client.interrupt()
             except Exception:
                 pass
-        self._emit(f"{MARKER_SESSION_START}")
-        self._emit("Interrupted")
-        self._emit(f"{MARKER_SESSION_END}")
+        self._emit_session_message("Interrupted")
         self._emit_ready()
 
     async def quit(self) -> None:
@@ -592,81 +603,57 @@ async def run_agent(
     )
 
     # Show initial session info
-    agent._emit(f"{MARKER_SESSION_START}")
-    agent._emit(f"Session started in {work_dir}")
-    agent._emit(f"Using Claude Agent SDK with dynamic permissions")
-    agent._emit(f"{MARKER_SESSION_END}")
+    agent._emit({"type": "session_start", "work_dir": work_dir})
+    agent._emit_session_message(f"Session started in {work_dir}")
+    agent._emit_session_message("Using Claude Agent SDK with dynamic permissions")
     agent._emit_ready()
 
-    # Read input from stdin
+    # Read input from stdin - expect NDJSON messages
     loop = asyncio.get_event_loop()
     reader = asyncio.StreamReader()
     protocol = asyncio.StreamReaderProtocol(reader)
     await loop.connect_read_pipe(lambda: protocol, sys.stdin)
 
-    # Queue for user messages (so we can handle /permit while processing)
+    # Queue for user messages (so we can handle permissions while processing)
     message_queue: asyncio.Queue[str] = asyncio.Queue()
 
     # Task to read stdin and dispatch commands
     async def read_stdin():
-        input_buffer: list[str] = []  # Buffer for multi-line [INPUT]...[/INPUT] messages
-        in_input_block = False
-
         while agent._running:
             try:
                 line = await reader.readline()
                 if not line:
                     break
 
-                text = line.decode().rstrip('\n\r')
-
-                # Handle [INPUT] block framing for multi-line messages
-                if text == "[INPUT]":
-                    in_input_block = True
-                    input_buffer = []
-                    continue
-                elif text == "[/INPUT]":
-                    in_input_block = False
-                    # Join accumulated lines and queue as single message
-                    full_message = "\n".join(input_buffer)
-                    if full_message.strip():
-                        await message_queue.put(full_message)
-                    input_buffer = []
-                    continue
-                elif in_input_block:
-                    # Accumulate lines within [INPUT] block
-                    input_buffer.append(text)
-                    continue
-
-                # Skip empty lines outside of input blocks
-                text = text.strip()
+                text = line.decode().strip()
                 if not text:
                     continue
 
-                # Handle special commands immediately
-                if text == "/quit":
+                # Parse JSON message
+                try:
+                    msg = json.loads(text)
+                except json.JSONDecodeError:
+                    agent._emit_error(f"Invalid JSON: {text}")
+                    continue
+
+                msg_type = msg.get("type")
+
+                if msg_type == "quit":
                     await agent.quit()
                     break
-                elif text == "/interrupt":
+                elif msg_type == "interrupt":
                     await agent.interrupt()
-                elif text.startswith("/permit "):
+                elif msg_type == "permission_response":
                     # Permission response - handle immediately (unblocks can_use_tool)
-                    try:
-                        json_str = text[8:]  # Strip "/permit "
-                        response = json.loads(json_str)
-                        agent.handle_permission_response(response)
-                    except json.JSONDecodeError as e:
-                        agent._emit(f"{MARKER_ERROR_START}")
-                        agent._emit(f"Invalid permission response: {e}")
-                        agent._emit(f"{MARKER_ERROR_END}")
+                    agent.handle_permission_response(msg)
+                elif msg_type == "message":
+                    # Queue user messages for processing
+                    await message_queue.put(msg.get("text", ""))
                 else:
-                    # Queue regular messages for processing (legacy single-line support)
-                    await message_queue.put(text)
+                    agent._emit_error(f"Unknown message type: {msg_type}")
 
             except Exception as e:
-                agent._emit(f"{MARKER_ERROR_START}")
-                agent._emit(f"stdin error: {e}")
-                agent._emit(f"{MARKER_ERROR_END}")
+                agent._emit_error(f"stdin error: {e}")
 
     # Task to process user messages to Claude
     async def process_messages():
@@ -677,9 +664,7 @@ async def run_agent(
             except asyncio.TimeoutError:
                 continue
             except Exception as e:
-                agent._emit(f"{MARKER_ERROR_START}")
-                agent._emit(f"Error: {e}")
-                agent._emit(f"{MARKER_ERROR_END}")
+                agent._emit_error(f"Error: {e}")
                 agent._emit_ready()
 
     # Run both tasks concurrently

@@ -901,7 +901,7 @@ If VIRTUAL-INDENT is non-nil, apply it as line-prefix/wrap-prefix."
                    (min (+ claude-agent--input-start-marker cursor-offset) (point-max))
                  claude-agent--input-start-marker))))
 
-;;;; Process filter - parsing markers
+;;;; Process filter - parsing NDJSON messages
 
 (defun claude-agent--process-filter (proc output)
   "Process filter for agent PROC handling OUTPUT."
@@ -911,258 +911,258 @@ If VIRTUAL-INDENT is non-nil, apply it as line-prefix/wrap-prefix."
         (claude-agent--handle-output output)))))
 
 (defun claude-agent--handle-output (output)
-  "Handle OUTPUT from the agent process, parsing markers."
+  "Handle OUTPUT from the agent process, parsing NDJSON messages."
   (setq claude-agent--pending-output
         (concat claude-agent--pending-output output))
 
-  ;; Process complete lines
+  ;; Process complete lines (each line is a JSON message)
   (while (string-match "\n" claude-agent--pending-output)
     (let ((line (substring claude-agent--pending-output 0 (match-beginning 0))))
       (setq claude-agent--pending-output
             (substring claude-agent--pending-output (match-end 0)))
-      (claude-agent--process-line line)))
+      (claude-agent--process-json-line line))))
 
-  ;; Also check if pending output is a complete marker without trailing newline
-  (when (and (not (string-empty-p claude-agent--pending-output))
-             (string-match "^\\[/?[A-Z_]+\\]$" claude-agent--pending-output))
-    (claude-agent--process-line claude-agent--pending-output)
-    (setq claude-agent--pending-output "")))
+(defun claude-agent--process-json-line (line)
+  "Process a single LINE of NDJSON output."
+  (when (and line (not (string-empty-p (string-trim line))))
+    (condition-case err
+        (let* ((msg (json-read-from-string line))
+               (msg-type (cdr (assq 'type msg))))
+          (claude-agent--dispatch-message msg-type msg))
+      (json-readtable-error
+       (message "Claude agent: Invalid JSON: %s" line))
+      (error
+       (message "Claude agent: Error processing message: %s" (error-message-string err))))))
 
-(defun claude-agent--process-line (line)
-  "Process a single LINE of output, handling markers."
+(defun claude-agent--dispatch-message (msg-type msg)
+  "Dispatch message MSG based on MSG-TYPE."
+  (pcase msg-type
+    ;; Ready - clear thinking, send queued messages
+    ("ready"
+     (claude-agent--set-thinking nil)
+     (when claude-agent--message-queue
+       (claude-agent--send-next-queued)))
+
+    ;; Session start
+    ("session_start"
+     nil)  ; Handled by buffer init
+
+    ;; Session info - update model/session-id
+    ("session_info"
+     (when-let ((model (cdr (assq 'model msg))))
+       (setq claude-agent--session-info
+             (plist-put claude-agent--session-info :model model)))
+     (when-let ((session-id (cdr (assq 'session_id msg))))
+       (setq claude-agent--session-info
+             (plist-put claude-agent--session-info :session-id session-id)))
+     (claude-agent--render-dynamic-section))
+
+    ;; Thinking status
+    ("thinking"
+     (let ((status (cdr (assq 'status msg))))
+       (unless claude-agent--thinking-start-time
+         (setq claude-agent--input-tokens 0
+               claude-agent--output-tokens 0
+               claude-agent--thinking-start-time (current-time)))
+       (claude-agent--set-thinking (or status "Thinking..."))))
+
+    ;; Progress - update token counts
+    ("progress"
+     (when-let ((input (cdr (assq 'input_tokens msg))))
+       (setq claude-agent--input-tokens input))
+     (when-let ((output (cdr (assq 'output_tokens msg))))
+       (setq claude-agent--output-tokens output)))
+
+    ;; Result - update cost
+    ("result"
+     (when-let ((cost (cdr (assq 'cost_usd msg))))
+       (setq claude-agent--session-info
+             (plist-put claude-agent--session-info :cost cost)))
+     (claude-agent--render-dynamic-section))
+
+    ;; MCP status
+    ("mcp_status"
+     (let ((servers (cdr (assq 'servers msg))))
+       (setq claude-agent--mcp-server-status servers)
+       (let ((failed (seq-filter
+                      (lambda (s) (not (equal (cdr (assq 'status s)) "connected")))
+                      servers)))
+         (when failed
+           (claude-agent--append-to-log
+            (format "\n⚠ MCP server issue: %s\n"
+                    (mapconcat (lambda (s)
+                                 (format "%s (%s)"
+                                         (cdr (assq 'name s))
+                                         (cdr (assq 'status s))))
+                               failed ", "))
+            'claude-agent-error-face)))))
+
+    ;; Permission request
+    ("permission_request"
+     (claude-agent--set-thinking "Awaiting permission...")
+     (claude-agent--show-permission-prompt msg))
+
+    ;; Permission granted (informational)
+    ("permission_granted"
+     nil)  ; Could show notification if desired
+
+    ;; User message start
+    ("user_start"
+     (setq claude-agent--parse-state 'user)
+     (setq claude-agent--has-conversation t)
+     (claude-agent--append-to-log
+      "\n━━━ You ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+      'claude-agent-user-header-face))
+
+    ;; User message text
+    ("user_text"
+     (let ((text (cdr (assq 'text msg))))
+       (claude-agent--append-to-log (concat text "\n") 'claude-agent-user-face "  ")))
+
+    ;; User message end
+    ("user_end"
+     (setq claude-agent--parse-state nil))
+
+    ;; Assistant message start
+    ("assistant_start"
+     (setq claude-agent--parse-state 'assistant)
+     (claude-agent--append-to-log
+      "\n━━━ Claude ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+      'claude-agent-assistant-header-face))
+
+    ;; Assistant message text
+    ("assistant_text"
+     (let ((text (cdr (assq 'text msg))))
+       (claude-agent--append-to-log (concat text "\n") nil "  ")))
+
+    ;; Assistant message end
+    ("assistant_end"
+     (setq claude-agent--parse-state nil))
+
+    ;; Tool call
+    ("tool_call"
+     (let* ((name (cdr (assq 'name msg)))
+            (input (cdr (assq 'input msg)))
+            (args-str (claude-agent--format-tool-input-for-display name input)))
+       (setq claude-agent--parse-state (if (string= name "Read") 'read-tool 'tool))
+       ;; Format based on tool type
+       (cond
+        ((string= name "Bash")
+         (claude-agent--insert-bash-tool (cdr (assq 'command input))))
+        ((string= name "Read")
+         (claude-agent--insert-read-tool (cdr (assq 'file_path input))))
+        (t
+         (claude-agent--insert-tool-call name args-str)))))
+
+    ;; Tool result
+    ("tool_result"
+     (let ((content (cdr (assq 'content msg)))
+           (is-error (cdr (assq 'is_error msg))))
+       (if (eq claude-agent--parse-state 'read-tool)
+           ;; Read tool - use special formatted display
+           (claude-agent--insert-read-content content)
+         ;; Other tools - show in example block
+         (progn
+           (claude-agent--insert-tool-result-start)
+           (claude-agent--append-to-log (concat content "\n") nil " ")
+           (claude-agent--insert-tool-result-end)))))
+
+    ;; Tool end
+    ("tool_end"
+     (setq claude-agent--parse-state nil)
+     (claude-agent--set-thinking "Thinking..."))
+
+    ;; Edit tool (special display)
+    ("edit_tool"
+     (let ((file-path (cdr (assq 'file_path msg)))
+           (old-string (cdr (assq 'old_string msg)))
+           (new-string (cdr (assq 'new_string msg))))
+       (setq claude-agent--parse-state 'tool)
+       (claude-agent--set-thinking (format "Editing: %s" (file-name-nondirectory file-path)))
+       ;; Insert the diff display
+       (let* ((inhibit-read-only t)
+              (saved-input (claude-agent--get-input-text))
+              (cursor-offset (when (and claude-agent--input-start-marker
+                                        (marker-position claude-agent--input-start-marker)
+                                        (>= (point) claude-agent--input-start-marker))
+                               (- (point) claude-agent--input-start-marker))))
+         (delete-region claude-agent--static-end-marker (point-max))
+         (goto-char claude-agent--static-end-marker)
+         (claude-agent--insert-diff file-path old-string new-string)
+         (set-marker claude-agent--static-end-marker (point))
+         (when claude-agent--has-conversation
+           (claude-agent--insert-status-bar))
+         (setq claude-agent--input-start-marker (point-marker))
+         (insert saved-input)
+         (claude-agent--update-read-only)
+         (claude-agent--update-placeholder)
+         (goto-char (if (and cursor-offset (>= cursor-offset 0))
+                        (min (+ claude-agent--input-start-marker cursor-offset) (point-max))
+                      claude-agent--input-start-marker)))))
+
+    ;; Write tool (special display)
+    ("write_tool"
+     (let ((file-path (cdr (assq 'file_path msg)))
+           (content (cdr (assq 'content msg))))
+       (setq claude-agent--parse-state 'tool)
+       (claude-agent--set-thinking (format "Writing: %s" (file-name-nondirectory file-path)))
+       (claude-agent--insert-write-tool file-path)
+       (claude-agent--insert-write-content content)))
+
+    ;; Session message (system notifications)
+    ("session_message_start"
+     (setq claude-agent--parse-state 'session))
+
+    ("session_message_text"
+     (let ((text (cdr (assq 'text msg))))
+       (claude-agent--append-to-log (concat text "\n") 'claude-agent-session-face)))
+
+    ("session_message_end"
+     (setq claude-agent--parse-state nil))
+
+    ;; Error
+    ("error"
+     (let ((message-text (cdr (assq 'message msg)))
+           (traceback (cdr (assq 'traceback msg))))
+       (claude-agent--append-to-log
+        (format "\n⚠ Error: %s\n" message-text)
+        'claude-agent-error-face)
+       (when traceback
+         (claude-agent--append-to-log
+          (format "Traceback:\n%s\n" traceback)
+          'claude-agent-error-face))))
+
+    ;; Unknown message type
+    (_
+     (message "Claude agent: Unknown message type: %s" msg-type))))
+
+(defun claude-agent--format-tool-input-for-display (tool-name tool-input)
+  "Format TOOL-INPUT for display based on TOOL-NAME."
   (cond
-   ;; Ready marker - clear thinking, send queued messages
-   ((string= line "[READY]")
-    (claude-agent--set-thinking nil)
-    ;; If there are queued messages, send the next one
-    (when claude-agent--message-queue
-      (claude-agent--send-next-queued)))
-
-   ;; Thinking marker - show thinking indicator
-   ((string= line "[THINKING]")
-    (setq claude-agent--input-tokens 0
-          claude-agent--output-tokens 0
-          claude-agent--thinking-start-time (current-time))
-    (claude-agent--set-thinking "Thinking..."))
-
-   ;; Progress marker - update token counts
-   ((string-match "^\\[PROGRESS \\(.*\\)\\]$" line)
-    (let* ((json-str (match-string 1 line))
-           (data (ignore-errors (json-read-from-string json-str))))
-      (when data
-        (when-let ((input (cdr (assq 'input_tokens data))))
-          (setq claude-agent--input-tokens input))
-        (when-let ((output (cdr (assq 'output_tokens data))))
-          (setq claude-agent--output-tokens output)))))
-
-   ;; Result marker - update cost
-   ((string-match "^\\[RESULT \\(.*\\)\\]$" line)
-    (let* ((json-str (match-string 1 line))
-           (data (ignore-errors (json-read-from-string json-str))))
-      (when data
-        (let ((cost (cdr (assq 'cost_usd data))))
-          (when cost
-            (setq claude-agent--session-info
-                  (plist-put claude-agent--session-info :cost cost))))
-        (claude-agent--render-dynamic-section))))
-
-   ;; Session info marker - update model/session-id
-   ((string-match "^\\[SESSION_INFO \\(.*\\)\\]$" line)
-    (let* ((json-str (match-string 1 line))
-           (data (ignore-errors (json-read-from-string json-str))))
-      (when data
-        (when-let ((model (cdr (assq 'model data))))
-          (setq claude-agent--session-info
-                (plist-put claude-agent--session-info :model model)))
-        (when-let ((session-id (cdr (assq 'session_id data))))
-          (setq claude-agent--session-info
-                (plist-put claude-agent--session-info :session-id session-id)))
-        (claude-agent--render-dynamic-section))))
-
-   ;; MCP server status marker - update MCP status
-   ((string-match "^\\[MCP_STATUS \\(.*\\)\\]$" line)
-    (let* ((json-str (match-string 1 line))
-           (data (ignore-errors (json-read-from-string json-str))))
-      (when data
-        (setq claude-agent--mcp-server-status data)
-        ;; Log any failed servers
-        (let ((failed (seq-filter (lambda (s) (not (equal (cdr (assq 'status s)) "connected")))
-                                  data)))
-          (when failed
-            (claude-agent--append-to-log
-             (format "\n⚠ MCP server issue: %s\n"
-                     (mapconcat (lambda (s)
-                                  (format "%s (%s)"
-                                          (cdr (assq 'name s))
-                                          (cdr (assq 'status s))))
-                                failed ", "))
-             'claude-agent-error-face))))))
-
-   ;; Permission request marker - show permission UI
-   ((string-match "^\\[PERMISSION_REQUEST \\(.*\\)\\]$" line)
-    (let* ((json-str (match-string 1 line))
-           (data (ignore-errors (json-read-from-string json-str))))
-      (when data
-        (claude-agent--set-thinking "Awaiting permission...")
-        (claude-agent--show-permission-prompt data))))
-
-   ;; Edit tool marker - show fancy diff display
-   ((string-match "^\\[EDIT \\(.*\\)\\]$" line)
-    (let* ((json-str (match-string 1 line))
-           (data (ignore-errors (json-read-from-string json-str))))
-      (when data
-        (let ((file-path (cdr (assq 'file_path data)))
-              (old-string (cdr (assq 'old_string data)))
-              (new-string (cdr (assq 'new_string data))))
-          (setq claude-agent--parse-state 'tool)
-          (claude-agent--set-thinking (format "Editing: %s" (file-name-nondirectory file-path)))
-          ;; Insert the diff display directly into the static section
-          (let* ((inhibit-read-only t)
-                 (saved-input (claude-agent--get-input-text))
-                 (cursor-offset (when (and claude-agent--input-start-marker
-                                           (marker-position claude-agent--input-start-marker)
-                                           (>= (point) claude-agent--input-start-marker))
-                                  (- (point) claude-agent--input-start-marker))))
-            ;; Delete dynamic section
-            (delete-region claude-agent--static-end-marker (point-max))
-            ;; Go to end of static section and insert diff
-            (goto-char claude-agent--static-end-marker)
-            (claude-agent--insert-diff file-path old-string new-string)
-            (set-marker claude-agent--static-end-marker (point))
-            ;; Insert status bar
-            (when claude-agent--has-conversation
-              (claude-agent--insert-status-bar))
-            ;; Set input marker and restore input
-            (setq claude-agent--input-start-marker (point-marker))
-            (insert saved-input)
-            ;; Finalize
-            (claude-agent--update-read-only)
-            (claude-agent--update-placeholder)
-            ;; Restore cursor
-            (goto-char (if (and cursor-offset (>= cursor-offset 0))
-                           (min (+ claude-agent--input-start-marker cursor-offset) (point-max))
-                         claude-agent--input-start-marker)))))))
-
-   ;; Write tool marker - show header then content like Read tool
-   ((string-match "^\\[WRITE \\(.*\\)\\]$" line)
-    (let* ((json-str (match-string 1 line))
-           (data (ignore-errors (json-read-from-string json-str))))
-      (when data
-        (let ((file-path (cdr (assq 'file_path data)))
-              (content (cdr (assq 'content data))))
-          (setq claude-agent--parse-state 'tool)
-          (claude-agent--set-thinking (format "Writing: %s" (file-name-nondirectory file-path)))
-          ;; Insert header first, then content (like Read tool pattern)
-          (claude-agent--insert-write-tool file-path)
-          (claude-agent--insert-write-content content)))))
-
-   ;; User message start
-   ((string= line "[USER]")
-    (setq claude-agent--parse-state 'user)
-    ;; Mark conversation as started on first user message
-    (setq claude-agent--has-conversation t)
-    (claude-agent--append-to-log
-     "\n━━━ You ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-     'claude-agent-user-header-face))
-
-   ;; User message end
-   ((string= line "[/USER]")
-    (setq claude-agent--parse-state nil))
-
-   ;; Assistant message start
-   ((string= line "[ASSISTANT]")
-    (setq claude-agent--parse-state 'assistant)
-    (claude-agent--append-to-log
-     "\n━━━ Claude ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-     'claude-agent-assistant-header-face))
-
-   ;; Assistant message end
-   ((string= line "[/ASSISTANT]")
-    (setq claude-agent--parse-state nil))
-
-   ;; Tool start - format based on tool type
-   ((string-match "^\\[TOOL \\(.+\\)\\]$" line)
-    (let* ((tool-info (match-string 1 line))
-           (tool-name tool-info)
-           (tool-args ""))
-      ;; Parse tool name and args if JSON provided
-      (when (string-match "^\\([^ ]+\\) \\(.*\\)$" tool-info)
-        (setq tool-name (match-string 1 tool-info)
-              tool-args (match-string 2 tool-info)))
-      (setq claude-agent--parse-state (if (string= tool-name "Read") 'read-tool 'tool))
-      (claude-agent--set-thinking (format "Running: %s" tool-name))
-      ;; Format based on tool type
-      (cond
-       ((string= tool-name "Bash")
-        (claude-agent--insert-bash-tool tool-args))
-       ((string= tool-name "Read")
-        (claude-agent--insert-read-tool tool-args))
-       (t
-        (claude-agent--insert-tool-call tool-name tool-args)))))
-
-   ;; Tool result start - format based on current tool type
-   ((string= line "[TOOL_RESULT]")
-    (if (eq claude-agent--parse-state 'read-tool)
-        (setq claude-agent--parse-state 'read-tool-result)
-      (progn
-        (setq claude-agent--parse-state 'tool-result)
-        (claude-agent--insert-tool-result-start))))
-
-   ;; Tool result end
-   ((string= line "[/TOOL_RESULT]")
-    (if (eq claude-agent--parse-state 'read-tool-result)
-        (setq claude-agent--parse-state 'read-tool)
-      (progn
-        (claude-agent--insert-tool-result-end)
-        (setq claude-agent--parse-state 'tool))))
-
-   ;; Tool end
-   ((string= line "[/TOOL]")
-    (setq claude-agent--parse-state nil)
-    (claude-agent--set-thinking "Thinking..."))
-
-   ;; Session info start (legacy)
-   ((string= line "[SESSION]")
-    (setq claude-agent--parse-state 'session))
-
-   ;; Session info end (legacy)
-   ((string= line "[/SESSION]")
-    (setq claude-agent--parse-state nil))
-
-   ;; Error start
-   ((string= line "[ERROR]")
-    (setq claude-agent--parse-state 'error)
-    (claude-agent--append-to-log "\n⚠ Error: " 'claude-agent-error-face))
-
-   ;; Error end
-   ((string= line "[/ERROR]")
-    (setq claude-agent--parse-state nil)
-    (claude-agent--append-to-log "\n" nil))
-
-   ;; Regular content line
+   ((member tool-name '("Read" "Write" "Edit"))
+    (cdr (assq 'file_path tool-input)))
+   ((string= tool-name "Bash")
+    (let ((cmd (cdr (assq 'command tool-input))))
+      (if (> (length cmd) 60)
+          (concat (substring cmd 0 57) "...")
+        cmd)))
+   ((string= tool-name "Glob")
+    (cdr (assq 'pattern tool-input)))
+   ((string= tool-name "Grep")
+    (let ((pattern (cdr (assq 'pattern tool-input)))
+          (path (cdr (assq 'path tool-input))))
+      (if path (format "%s, %s" pattern path) pattern)))
+   ((string= tool-name "WebFetch")
+    (cdr (assq 'url tool-input)))
+   ((string= tool-name "Task")
+    (let ((desc (cdr (assq 'description tool-input))))
+      (if (> (length desc) 40) (substring desc 0 40) desc)))
    (t
-    ;; Skip session content - it's redundant with our header/status sections
-    (cond
-     ;; Session content - skip entirely
-     ((eq claude-agent--parse-state 'session)
-      nil)
-     ;; Read tool result - use special formatted display
-     ((eq claude-agent--parse-state 'read-tool-result)
-      (claude-agent--insert-read-content line))
-     ;; Other content
-     (t
-      (let* ((face (pcase claude-agent--parse-state
-                     ('user 'claude-agent-user-face)
-                     ('assistant nil)  ; Let org fontification handle Claude's output
-                     ('tool 'claude-agent-tool-face)
-                     ('error 'claude-agent-error-face)
-                     (_ nil)))
-             ;; Use virtual indent (line-prefix) for user/assistant - doesn't break org
-             (virtual-indent (pcase claude-agent--parse-state
-                               ('user "  ")
-                               ('assistant "  ")
-                               (_ nil))))
-        (claude-agent--append-to-log (concat line "\n") face virtual-indent)))))))
+    (let ((first-val (cdar tool-input)))
+      (if first-val
+          (let ((val-str (format "%s" first-val)))
+            (if (> (length val-str) 40) (substring val-str 0 40) val-str))
+        "")))))
 
 ;;;; Permission prompt UI
 
@@ -1428,8 +1428,9 @@ Restores text input mode and any saved input."
             (pattern (when scope
                        (claude-agent--generate-permission-pattern
                         tool-name tool-input scope)))
-            (response (json-encode `((action . ,action)
-                                     (pattern . ,pattern))))
+            (response-msg `((type . "permission_response")
+                            (action . ,action)
+                            (pattern . ,pattern)))
             (saved-input claude-agent--saved-input))
        ;; Clear permission state and disable minor mode in all related buffers
        (setq claude-agent--permission-data nil)
@@ -1454,11 +1455,11 @@ Restores text input mode and any saved input."
        (setq claude-agent--input-mode 'empty)
        ;; Show thinking status (this rebuilds dynamic section with empty input)
        (claude-agent--set-thinking "Processing...")
-       ;; Send response to process
+       ;; Send JSON response to process
        (when (and claude-agent--process
                   (process-live-p claude-agent--process))
          (process-send-string claude-agent--process
-                              (format "/permit %s\n" response)))))))
+                              (concat (json-encode response-msg) "\n")))))))
 
 (defun claude-agent-permit-once ()
   "Allow the tool to run once."
@@ -1547,9 +1548,9 @@ Optional CONTINUE-SESSION, if non-nil, continues the most recent session."
              claude-agent--process
              (process-live-p claude-agent--process))
     (let ((msg (pop claude-agent--message-queue)))
-      ;; Send to process
+      ;; Send JSON message to process
       (process-send-string claude-agent--process
-                           (concat "[INPUT]\n" msg "\n[/INPUT]\n")))))
+                           (concat (json-encode `((type . "message") (text . ,msg))) "\n")))))
 
 (defun claude-agent-send ()
   "Send the current input to Claude, or queue if busy."
@@ -1574,9 +1575,9 @@ Optional CONTINUE-SESSION, if non-nil, continues the most recent session."
                (push input claude-agent--message-queue)
                (claude-agent--render-dynamic-section)
                (message "Message queued (agent is busy)"))
-           ;; Send to process - wrap in [INPUT]...[/INPUT] for multi-line support
+           ;; Send JSON message to process
            (process-send-string claude-agent--process
-                                (concat "[INPUT]\n" input "\n[/INPUT]\n"))
+                                (concat (json-encode `((type . "message") (text . ,input))) "\n"))
            ;; Re-render dynamic section (input already cleared)
            (claude-agent--render-dynamic-section)))))))
 
@@ -1595,7 +1596,8 @@ Optional CONTINUE-SESSION, if non-nil, continues the most recent session."
   (claude-agent--in-base-buffer
    (when (and claude-agent--process
               (process-live-p claude-agent--process))
-     (process-send-string claude-agent--process "/interrupt\n"))))
+     (process-send-string claude-agent--process
+                          (concat (json-encode '((type . "interrupt"))) "\n")))))
 
 (defun claude-agent-quit ()
   "Quit the Claude session."
@@ -1604,7 +1606,8 @@ Optional CONTINUE-SESSION, if non-nil, continues the most recent session."
     (claude-agent--in-base-buffer
      (when (and claude-agent--process
                 (process-live-p claude-agent--process))
-       (process-send-string claude-agent--process "/quit\n")))))
+       (process-send-string claude-agent--process
+                            (concat (json-encode '((type . "quit"))) "\n"))))))
 
 (defun claude-agent-previous-input ()
   "Recall previous input from history."
